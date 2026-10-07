@@ -10,6 +10,7 @@ public class UpgradeTask {
     private final String targetVersion;
     private final String fromVersion;
     private UpgradeStatus status = UpgradeStatus.PENDING;
+    private UpgradeEndCause endCause;
     private Instant deadline;
     private String detail = "created";
 
@@ -28,6 +29,8 @@ public class UpgradeTask {
     public String getFromVersion() { return fromVersion; }
     public UpgradeStatus getStatus() { return status; }
     public void setStatus(UpgradeStatus status) { this.status = status; }
+    public UpgradeEndCause getEndCause() { return endCause; }
+    public void setEndCause(UpgradeEndCause endCause) { this.endCause = endCause; }
     public Instant getDeadline() { return deadline; }
     public void setDeadline(Instant deadline) { this.deadline = deadline; }
     public String getDetail() { return detail; }

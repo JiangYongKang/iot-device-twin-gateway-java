@@ -3,6 +3,7 @@ package com.github.highcumontoa.iotdevicetwingatewayjava.service;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Service;
 import com.github.highcumontoa.iotdevicetwingatewayjava.domain.Device;
 import com.github.highcumontoa.iotdevicetwingatewayjava.domain.DeviceState;
 import com.github.highcumontoa.iotdevicetwingatewayjava.domain.UpgradeStatus;
+import com.github.highcumontoa.iotdevicetwingatewayjava.domain.UpgradeEndCause;
 import com.github.highcumontoa.iotdevicetwingatewayjava.domain.UpgradeTask;
 import com.github.highcumontoa.iotdevicetwingatewayjava.support.MutableClock;
 
@@ -114,6 +116,7 @@ public class FirmwareService {
                 return false;
             }
             task.setStatus(UpgradeStatus.SUCCESS);
+            task.setEndCause(UpgradeEndCause.DEVICE_CONFIRMED);
             task.setDetail("device confirmed " + version);
             deviceService.find(deviceId).ifPresent(d -> d.setFirmwareVersion(version));
             activeByDevice.remove(deviceId);
@@ -131,6 +134,7 @@ public class FirmwareService {
                 return false;
             }
             task.setStatus(UpgradeStatus.FAILED);
+            task.setEndCause(UpgradeEndCause.DEVICE_REPORTED_FAILURE);
             task.setDetail("device reported failure: " + reason);
             log.info("device={} task={} action=fail outcome=FAILED reason={}", deviceId, task.getTaskId(), reason);
             rollback(deviceId, task);
@@ -140,23 +144,71 @@ public class FirmwareService {
 
     /** 扫描超时任务并回滚。 */
     public List<UpgradeTask> sweepTimeouts() {
+        return sweepTimeouts(activeByDevice.keySet());
+    }
+
+    /** 只扫描给定设备范围内的超时任务并回滚（灰度推进时按批次精确扫描）。 */
+    public List<UpgradeTask> sweepTimeouts(Collection<String> deviceIds) {
         List<UpgradeTask> timedOut = new ArrayList<>();
         Instant now = clock.now();
-        for (Map.Entry<String, UpgradeTask> entry : activeByDevice.entrySet()) {
-            String deviceId = entry.getKey();
+        for (String deviceId : deviceIds) {
+            UpgradeTask task = activeByDevice.get(deviceId);
+            if (task == null) {
+                continue;
+            }
             synchronized (deviceService.lockOf(deviceId)) {
-                UpgradeTask task = entry.getValue();
-                if (task.getStatus() == UpgradeStatus.IN_PROGRESS && now.isAfter(task.getDeadline())) {
-                    task.setStatus(UpgradeStatus.TIMEOUT);
-                    task.setDetail("no confirmation before deadline " + task.getDeadline());
+                UpgradeTask current = activeByDevice.get(deviceId);
+                if (current != null && current == task
+                        && current.getStatus() == UpgradeStatus.IN_PROGRESS && now.isAfter(current.getDeadline())) {
+                    current.setStatus(UpgradeStatus.TIMEOUT);
+                    current.setEndCause(UpgradeEndCause.DEADLINE);
+                    current.setDetail("no confirmation before deadline " + current.getDeadline());
                     log.info("device={} task={} action=sweep outcome=TIMEOUT now={} deadline={}",
-                            deviceId, task.getTaskId(), now, task.getDeadline());
-                    rollback(deviceId, task);
-                    timedOut.add(task);
+                            deviceId, current.getTaskId(), now, current.getDeadline());
+                    rollback(deviceId, current);
+                    timedOut.add(current);
                 }
             }
         }
         return timedOut;
+    }
+
+    /**
+     * 叫停一台仍在途的升级任务：状态置为 ABORTED 并回滚到升级前版本。
+     * 仅进行中任务可叫停；已成功/失败/隔离的设备原样保留。返回是否执行了叫停。
+     */
+    public boolean abortInFlight(String deviceId, String reason) {
+        synchronized (deviceService.lockOf(deviceId)) {
+            UpgradeTask task = activeByDevice.get(deviceId);
+            if (task == null || task.getStatus() != UpgradeStatus.IN_PROGRESS) {
+                return false;
+            }
+            task.setStatus(UpgradeStatus.ABORTED);
+            task.setEndCause(UpgradeEndCause.ABORTED);
+            task.setDetail("rollout aborted: " + reason);
+            log.info("device={} task={} action=abort outcome=ABORTED reason={}",
+                    deviceId, task.getTaskId(), reason);
+            rollbackAfterAbort(deviceId, task);
+            return true;
+        }
+    }
+
+    /** 查询某设备在指定批次中的最新任务（无任务返回空，待命设备即无任务）。 */
+    public Optional<UpgradeTask> taskFor(String batchId, String deviceId) {
+        synchronized (history) {
+            UpgradeTask found = null;
+            for (UpgradeTask task : history) {
+                if (task.getBatchId().equals(batchId) && task.getDeviceId().equals(deviceId)) {
+                    found = task;
+                }
+            }
+            return Optional.ofNullable(found);
+        }
+    }
+
+    /** 当前仍有在途任务的设备快照（任务终态即从 activeByDevice 移除）。 */
+    public java.util.Set<String> activeDeviceIds() {
+        return new java.util.HashSet<>(activeByDevice.keySet());
     }
 
     public Optional<UpgradeTask> taskOf(String deviceId) {
@@ -175,6 +227,15 @@ public class FirmwareService {
         task.setDetail(task.getDetail() + " -> rolled back to " + task.getFromVersion());
         activeByDevice.remove(deviceId);
         log.info("device={} task={} action=rollback outcome=ROLLED_BACK restored={}",
+                deviceId, task.getTaskId(), task.getFromVersion());
+    }
+
+    /** 叫停回滚：固件恢复到升级前版本，但任务结论保留为 ABORTED（与设备失败的 ROLLED_BACK 区分）。 */
+    private void rollbackAfterAbort(String deviceId, UpgradeTask task) {
+        deviceService.find(deviceId).ifPresent(d -> d.setFirmwareVersion(task.getFromVersion()));
+        task.setDetail(task.getDetail() + " -> rolled back to " + task.getFromVersion());
+        activeByDevice.remove(deviceId);
+        log.info("device={} task={} action=rollback outcome=ABORTED restored={}",
                 deviceId, task.getTaskId(), task.getFromVersion());
     }
 

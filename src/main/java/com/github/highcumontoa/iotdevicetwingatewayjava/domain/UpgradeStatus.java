@@ -15,5 +15,7 @@ public enum UpgradeStatus {
     /** 已回滚到升级前版本。 */
     ROLLED_BACK,
     /** 版本或前置条件不满足，设备被隔离（不影响同批其他设备）。 */
-    ISOLATED
+    ISOLATED,
+    /** 灰度批次中途叫停（区别于设备自身失败与前置隔离）：在途设备回滚到升级前版本，待命设备从未下发。 */
+    ABORTED
 }
