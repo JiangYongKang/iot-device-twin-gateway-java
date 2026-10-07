@@ -12,6 +12,8 @@ public class UpgradeTask {
     private UpgradeStatus status = UpgradeStatus.PENDING;
     private Instant deadline;
     private String detail = "created";
+    private UpgradeStatus rollbackCause;
+    private Integer waveIndex;
 
     public UpgradeTask(String taskId, String batchId, String deviceId, String targetVersion, String fromVersion) {
         this.taskId = taskId;
@@ -32,4 +34,10 @@ public class UpgradeTask {
     public void setDeadline(Instant deadline) { this.deadline = deadline; }
     public String getDetail() { return detail; }
     public void setDetail(String detail) { this.detail = detail; }
+    /** 回滚诱因：FAILED（设备自报失败）/ TIMEOUT（超时）/ ABORTED（批次中途叫停）。 */
+    public UpgradeStatus getRollbackCause() { return rollbackCause; }
+    public void setRollbackCause(UpgradeStatus rollbackCause) { this.rollbackCause = rollbackCause; }
+    /** 所属灰度波次序号；整批直推（非灰度）为 null。 */
+    public Integer getWaveIndex() { return waveIndex; }
+    public void setWaveIndex(Integer waveIndex) { this.waveIndex = waveIndex; }
 }

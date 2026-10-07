@@ -12,8 +12,10 @@ public enum UpgradeStatus {
     FAILED,
     /** 超时未确认，等待回滚。 */
     TIMEOUT,
-    /** 已回滚到升级前版本。 */
+    /** 已回滚到升级前版本（诱因见 {@link UpgradeTask#getRollbackCause()}）。 */
     ROLLED_BACK,
     /** 版本或前置条件不满足，设备被隔离（不影响同批其他设备）。 */
-    ISOLATED
+    ISOLATED,
+    /** 灰度批次中途叫停：设备自身既未失败也未被隔离，由批次判定/人工中止并回滚。 */
+    ABORTED
 }

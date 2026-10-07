@@ -54,12 +54,21 @@ public class FirmwareService {
     public List<UpgradeTask> startBatch(String batchId, List<String> deviceIds, String targetVersion) {
         List<UpgradeTask> tasks = new ArrayList<>();
         for (String deviceId : deviceIds) {
-            tasks.add(startOne(batchId, deviceId, targetVersion));
+            tasks.add(startOne(batchId, deviceId, targetVersion, null));
         }
         return tasks;
     }
 
+    /** 下发单台设备升级并打上波次标记；前置条件不满足则隔离。供灰度波次推进调用。 */
+    public UpgradeTask startOne(String batchId, String deviceId, String targetVersion, Integer waveIndex) {
+        return startOneInternal(batchId, deviceId, targetVersion, waveIndex);
+    }
+
     private UpgradeTask startOne(String batchId, String deviceId, String targetVersion) {
+        return startOneInternal(batchId, deviceId, targetVersion, null);
+    }
+
+    private UpgradeTask startOneInternal(String batchId, String deviceId, String targetVersion, Integer waveIndex) {
         synchronized (deviceService.lockOf(deviceId)) {
             Optional<Device> deviceOpt = deviceService.find(deviceId);
             UpgradeTask existing = activeByDevice.get(deviceId);
@@ -68,25 +77,26 @@ public class FirmwareService {
                         deviceId, batchId, existing.getTaskId());
                 return isolate(batchId, deviceId, targetVersion,
                         deviceOpt.map(Device::getFirmwareVersion).orElse("unknown"),
-                        "concurrent upgrade rejected, active task " + existing.getTaskId());
+                        "concurrent upgrade rejected, active task " + existing.getTaskId(), waveIndex);
             }
             if (deviceOpt.isEmpty()) {
                 log.info("device={} batch={} action=upgrade outcome=ISOLATED reason=unknown device", deviceId, batchId);
-                return isolate(batchId, deviceId, targetVersion, "unknown", "device not registered");
+                return isolate(batchId, deviceId, targetVersion, "unknown", "device not registered", waveIndex);
             }
             Device device = deviceOpt.get();
             if (device.getState() != DeviceState.ONLINE) {
                 log.info("device={} batch={} action=upgrade outcome=ISOLATED reason=device offline", deviceId, batchId);
-                return isolate(batchId, deviceId, targetVersion, device.getFirmwareVersion(), "device offline");
+                return isolate(batchId, deviceId, targetVersion, device.getFirmwareVersion(), "device offline", waveIndex);
             }
             if (device.getFirmwareVersion().equals(targetVersion)) {
-                log.info("device={} batch={} action=upgrade outcome=ISOLATED reason=already at target {}", 
+                log.info("device={} batch={} action=upgrade outcome=ISOLATED reason=already at target {}",
                         deviceId, batchId, targetVersion);
                 return isolate(batchId, deviceId, targetVersion, device.getFirmwareVersion(),
-                        "already at target version");
+                        "already at target version", waveIndex);
             }
             UpgradeTask task = new UpgradeTask("task-" + taskSeq.incrementAndGet(), batchId, deviceId,
                     targetVersion, device.getFirmwareVersion());
+            task.setWaveIndex(waveIndex);
             task.setStatus(UpgradeStatus.IN_PROGRESS);
             task.setDeadline(clock.now().plus(upgradeTimeout));
             task.setDetail("upgrade started");
@@ -133,30 +143,62 @@ public class FirmwareService {
             task.setStatus(UpgradeStatus.FAILED);
             task.setDetail("device reported failure: " + reason);
             log.info("device={} task={} action=fail outcome=FAILED reason={}", deviceId, task.getTaskId(), reason);
-            rollback(deviceId, task);
+            rollback(deviceId, task, UpgradeStatus.FAILED);
             return true;
         }
     }
 
     /** 扫描超时任务并回滚。 */
     public List<UpgradeTask> sweepTimeouts() {
+        return sweepTimeouts(null);
+    }
+
+    /** 扫描指定批次（null 表示全部）的超时任务并回滚。 */
+    public List<UpgradeTask> sweepTimeouts(String batchId) {
         List<UpgradeTask> timedOut = new ArrayList<>();
         Instant now = clock.now();
         for (Map.Entry<String, UpgradeTask> entry : activeByDevice.entrySet()) {
             String deviceId = entry.getKey();
             synchronized (deviceService.lockOf(deviceId)) {
                 UpgradeTask task = entry.getValue();
-                if (task.getStatus() == UpgradeStatus.IN_PROGRESS && now.isAfter(task.getDeadline())) {
+                if (task.getStatus() == UpgradeStatus.IN_PROGRESS && now.isAfter(task.getDeadline())
+                        && (batchId == null || batchId.equals(task.getBatchId()))) {
                     task.setStatus(UpgradeStatus.TIMEOUT);
                     task.setDetail("no confirmation before deadline " + task.getDeadline());
-                    log.info("device={} task={} action=sweep outcome=TIMEOUT now={} deadline={}",
-                            deviceId, task.getTaskId(), now, task.getDeadline());
-                    rollback(deviceId, task);
+                    log.info("device={} batch={} task={} wave={} action=sweep outcome=TIMEOUT now={} deadline={}",
+                            deviceId, task.getBatchId(), task.getTaskId(), task.getWaveIndex(), now, task.getDeadline());
+                    rollback(deviceId, task, UpgradeStatus.TIMEOUT);
                     timedOut.add(task);
                 }
             }
         }
         return timedOut;
+    }
+
+    /**
+     * 中止设备进行中的升级任务：设备自身既未失败也未被隔离，结论置为 ABORTED 并回滚到升级前版本。
+     * 仅 IN_PROGRESS 任务可被中止；返回被中止的任务，没有进行中任务返回 empty。
+     */
+    public Optional<UpgradeTask> abortActive(String deviceId, String reason) {
+        synchronized (deviceService.lockOf(deviceId)) {
+            UpgradeTask task = activeByDevice.get(deviceId);
+            if (task == null || task.getStatus() != UpgradeStatus.IN_PROGRESS) {
+                return Optional.empty();
+            }
+            task.setStatus(UpgradeStatus.ABORTED);
+            task.setDetail("batch halted: " + reason);
+            log.info("device={} batch={} task={} wave={} action=abort outcome=ABORTED reason={}",
+                    deviceId, task.getBatchId(), task.getTaskId(), task.getWaveIndex(), reason);
+            rollback(deviceId, task, UpgradeStatus.ABORTED);
+            return Optional.of(task);
+        }
+    }
+
+    /** 查询某批次的全部升级任务（含隔离、成功、回滚、中止等终态记录）。 */
+    public List<UpgradeTask> tasksOfBatch(String batchId) {
+        synchronized (history) {
+            return history.stream().filter(t -> t.getBatchId().equals(batchId)).toList();
+        }
     }
 
     public Optional<UpgradeTask> taskOf(String deviceId) {
@@ -169,18 +211,21 @@ public class FirmwareService {
         }
     }
 
-    private void rollback(String deviceId, UpgradeTask task) {
+    private void rollback(String deviceId, UpgradeTask task, UpgradeStatus cause) {
         deviceService.find(deviceId).ifPresent(d -> d.setFirmwareVersion(task.getFromVersion()));
         task.setStatus(UpgradeStatus.ROLLED_BACK);
+        task.setRollbackCause(cause);
         task.setDetail(task.getDetail() + " -> rolled back to " + task.getFromVersion());
         activeByDevice.remove(deviceId);
-        log.info("device={} task={} action=rollback outcome=ROLLED_BACK restored={}",
-                deviceId, task.getTaskId(), task.getFromVersion());
+        log.info("device={} task={} action=rollback outcome=ROLLED_BACK restored={} cause={}",
+                deviceId, task.getTaskId(), task.getFromVersion(), cause);
     }
 
-    private UpgradeTask isolate(String batchId, String deviceId, String targetVersion, String fromVersion, String reason) {
+    private UpgradeTask isolate(String batchId, String deviceId, String targetVersion, String fromVersion,
+                                String reason, Integer waveIndex) {
         UpgradeTask task = new UpgradeTask("task-" + taskSeq.incrementAndGet(), batchId, deviceId,
                 targetVersion, fromVersion);
+        task.setWaveIndex(waveIndex);
         task.setStatus(UpgradeStatus.ISOLATED);
         task.setDetail(reason);
         synchronized (history) {
